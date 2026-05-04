@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -14,33 +13,31 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-type lineKind int
+// ── Screens ────────────────────────────────────────────────────────────────────
+
+type screenID int
 
 const (
-	kSystem lineKind = iota
-	kUser
-	kAgent
-	kOK
-	kErr
+	scrHome screenID = iota
+	scrWork
+	scrStatus
 )
 
-type chatLine struct {
-	kind        lineKind
-	agent, text string
+// ── Agent / Task types ─────────────────────────────────────────────────────────
+
+type agentState struct {
+	name, model, status string
+	isJudge             bool
 }
-type taskStatus string
 
-const (
-	tsPending taskStatus = "pending"
-	tsRun     taskStatus = "in_progress"
-	tsDone    taskStatus = "done"
-)
-
-type task struct {
+type taskState struct {
 	id, title, owner string
 	deps             []string
-	status           taskStatus
+	status           string // pending, running, done
+	progress         float64
 }
+
+// ── Flow step for scripted demo ────────────────────────────────────────────────
 
 type flowStep struct {
 	delay       time.Duration
@@ -48,87 +45,92 @@ type flowStep struct {
 	action      string
 	done        bool
 }
-type flowMsg struct{ step flowStep }
+type flowTick struct{ step flowStep }
 
-var (
-	colorBorder = lipgloss.Color("#4B3470")
-	colorText   = lipgloss.Color("#ECE7FA")
-	colorSubtle = lipgloss.Color("#9D8CC4")
-	colorPurple = lipgloss.Color("#B084FF")
-	colorPink   = lipgloss.Color("#EC7EF6")
-	colorGreen  = lipgloss.Color("#34D399")
-	colorRed    = lipgloss.Color("#FB7185")
-	colorBlue   = lipgloss.Color("#60A5FA")
-	colorAmber  = lipgloss.Color("#F59E0B")
+func scheduleStep(s flowStep) tea.Cmd {
+	return tea.Tick(s.delay, func(time.Time) tea.Msg { return flowTick{s} })
+}
 
-	styleRoot = lipgloss.NewStyle().Foreground(colorText)
-	styleTop  = lipgloss.NewStyle().BorderBottom(true).BorderForeground(colorBorder).Padding(0, 1)
-	styleBox  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder)
-	styleIn   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorPurple).Padding(0, 1)
-	styleFoot = lipgloss.NewStyle().Foreground(colorSubtle).Padding(0, 1)
-	styleSep  = lipgloss.NewStyle().Foreground(colorBorder)
+// ── Log line ───────────────────────────────────────────────────────────────────
 
-	styleAccent = lipgloss.NewStyle().Foreground(colorPurple).Bold(true)
-	styleSubtle = lipgloss.NewStyle().Foreground(colorSubtle)
-	styleUser   = lipgloss.NewStyle().Foreground(colorPink).Bold(true)
-	styleOK     = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
-	styleErr    = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
+type logKind int
+
+const (
+	logSys logKind = iota
+	logUser
+	logAgent
+	logOk
+	logErr
 )
 
-type model struct {
-	w, h int
+type logLine struct {
+	kind  logKind
+	agent string
+	text  string
+}
 
-	vp   viewport.Model
+// ── Model ──────────────────────────────────────────────────────────────────────
+
+type model struct {
+	w, h   int
+	screen screenID
+
 	in   textinput.Model
+	vp   viewport.Model
 	spin spinner.Model
 
-	busy  bool
-	phase string
+	project string
+	phase   string // idle, plan, divide, work
+	busy    bool
 
-	chat  []chatLine
-	tasks []task
-
-	agents map[string]string
+	log    []logLine
+	tasks  []taskState
+	agents []agentState
 	queue  []flowStep
 }
 
 func newModel() model {
-	in := textinput.New()
-	in.Prompt = ""
-	in.Placeholder = "Type command: /plan /divide /work /tasks /clear /help"
-	in.TextStyle = lipgloss.NewStyle().Foreground(colorText)
-	in.PlaceholderStyle = styleSubtle
-	in.Cursor.Style = lipgloss.NewStyle().Foreground(colorPurple)
-	in.Focus()
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.Placeholder = `enter project name or command (try: help)`
+	ti.TextStyle = lipgloss.NewStyle().Foreground(cText)
+	ti.PlaceholderStyle = sDim
+	ti.Cursor.Style = sPrimary
+	ti.Focus()
 
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
-	sp.Style = styleAccent
+	sp.Style = sPrimary
 
 	vp := viewport.New(80, 20)
-	vp.MouseWheelEnabled = true
 
 	m := model{
-		in:    in,
-		spin:  sp,
-		vp:    vp,
-		phase: "idle",
-		agents: map[string]string{
-			"judge":    "ready",
-			"claude":   "ready",
-			"opencode": "ready",
+		screen:  scrHome,
+		in:      ti,
+		spin:    sp,
+		vp:      vp,
+		phase:   "idle",
+		project: "",
+		agents: []agentState{
+			{"claude", "sonnet-4-5", "ready", true},
+			{"copilot", "sonnet-4.5", "ready", false},
+			{"opencode", "gpt-4o-mini", "ready", false},
 		},
 	}
 
-	m.push(kSystem, "", banner())
-	m.push(kSystem, "", "OpenCodeTUI (Aros CLI future UI) — dark purple two-split prototype")
-	m.push(kSystem, "", "Run /plan, /divide, /work")
-	m.refresh()
-
+	m.pushLog(logSys, "", banner())
+	m.pushLog(logSys, "", sPrimary.Render("AROS CLI")+" — Multi-agent AI orchestrator  •  v0.1.0")
+	m.pushLog(logSys, "", "")
+	m.pushLog(logSys, "", sMute.Render("Enter a project name to init, or type ")+sPrimary.Render("help"))
+	m.syncViewport()
 	return m
 }
 
-func (m model) Init() tea.Cmd { return tea.Batch(m.spin.Tick, textinput.Blink) }
+func (m model) Init() tea.Cmd {
+	return tea.Batch(m.spin.Tick, textinput.Blink)
+}
+
+// ── Update ─────────────────────────────────────────────────────────────────────
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -137,45 +139,53 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 		m.relayout()
-		m.refresh()
+		m.syncViewport()
 
 	case spinner.TickMsg:
 		var c tea.Cmd
 		m.spin, c = m.spin.Update(msg)
 		cmds = append(cmds, c)
 
-	case flowMsg:
-		m.applyStep(msg.step)
+	case flowTick:
+		m.applyFlow(msg.step)
+		m.syncViewport()
 		if len(m.queue) > 0 {
-			n := m.queue[0]
+			next := m.queue[0]
 			m.queue = m.queue[1:]
-			cmds = append(cmds, tickStep(n))
+			cmds = append(cmds, scheduleStep(next))
 		}
 
 	case tea.KeyMsg:
-		s := msg.String()
-		switch s {
-		case "ctrl+c", "esc":
+		switch msg.String() {
+		case "ctrl+c":
 			return m, tea.Quit
-		case "pgup", "pgdown", "home", "end", "ctrl+u", "ctrl+d":
+		case "esc":
+			if m.screen != scrHome {
+				m.screen = scrHome
+				return m, nil
+			}
+			return m, tea.Quit
+		case "ctrl+s":
+			m.screen = scrStatus
+			return m, nil
+		case "pgup", "pgdown", "up", "down":
 			var c tea.Cmd
 			m.vp, c = m.vp.Update(msg)
 			return m, c
 		}
 
 		if msg.Type == tea.KeyEnter {
-			t := strings.TrimSpace(m.in.Value())
+			raw := strings.TrimSpace(m.in.Value())
 			m.in.SetValue("")
-			if t == "" {
-				return m, nil
+			if raw != "" {
+				m.pushLog(logUser, "", raw)
+				m.handleCmd(raw)
+				m.syncViewport()
 			}
-			m.push(kUser, "", t)
-			m.runCommand(strings.ToLower(t))
-			m.refresh()
 			if len(m.queue) > 0 && m.busy {
-				n := m.queue[0]
+				next := m.queue[0]
 				m.queue = m.queue[1:]
-				cmds = append(cmds, tickStep(n))
+				cmds = append(cmds, scheduleStep(next))
 			}
 			return m, tea.Batch(cmds...)
 		}
@@ -188,307 +198,267 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m *model) relayout() {
-	if m.w == 0 || m.h == 0 {
-		return
-	}
-	leftW, _, mainH := panelLayout(m.w, m.h)
-	m.vp.Width = max(18, leftW-4)
-	m.vp.Height = max(6, mainH-4)
-	m.in.Width = max(20, m.w-10)
-}
+// ── Command handler ────────────────────────────────────────────────────────────
 
-func (m *model) runCommand(cmd string) {
-	switch strings.TrimSpace(cmd) {
-	case "/help":
-		m.push(kSystem, "", "Commands: /plan /divide /work /tasks /clear /help /quit")
-	case "/clear":
-		m.chat = nil
-	case "/tasks":
-		if len(m.tasks) == 0 {
-			m.push(kSystem, "", "No tasks yet. Run /divide first.")
-			return
-		}
-		for _, t := range m.tasks {
-			m.push(kSystem, "", fmt.Sprintf("%s %s %s", t.id, t.title, t.status))
-		}
-	case "/plan":
+func (m *model) handleCmd(raw string) {
+	cmd := strings.ToLower(strings.TrimSpace(raw))
+
+	switch {
+	case cmd == "help" || cmd == "/help":
+		m.pushLog(logSys, "", "")
+		m.pushLog(logSys, "", sPrimary.Render("Commands:"))
+		m.pushLog(logSys, "", "  "+sKey.Render("plan <desc>")+"   Start planning phase")
+		m.pushLog(logSys, "", "  "+sKey.Render("divide")+"        Break plan into tasks")
+		m.pushLog(logSys, "", "  "+sKey.Render("work")+"          Execute tasks")
+		m.pushLog(logSys, "", "  "+sKey.Render("status")+"        Show task board")
+		m.pushLog(logSys, "", "  "+sKey.Render("chat <msg>")+"    Chat with agent")
+		m.pushLog(logSys, "", "  "+sKey.Render("clear")+"         Clear log")
+		m.pushLog(logSys, "", "  "+sKey.Render("quit")+"          Exit")
+
+	case cmd == "clear" || cmd == "/clear":
+		m.log = nil
+
+	case cmd == "quit" || cmd == "/quit":
+		m.pushLog(logSys, "", "Press Ctrl+C or Esc to quit.")
+
+	case cmd == "status" || cmd == "/status":
+		m.screen = scrStatus
+
+	case strings.HasPrefix(cmd, "plan") || strings.HasPrefix(cmd, "/plan"):
 		if m.busy {
-			m.push(kErr, "", "Workflow already running")
+			m.pushLog(logErr, "", "Workflow already running.")
 			return
 		}
-		m.phase, m.busy = "plan", true
+		m.phase = "plan"
+		m.busy = true
+		m.screen = scrHome
+		m.setAgents("running")
+		m.pushLog(logSys, "", "")
+		m.pushLog(logSys, "", sPrimary.Render("── Plan Phase ──"))
+		m.queue = []flowStep{
+			{400 * time.Millisecond, "claude", "Analyzing requirements… 4-layer arch: storage → service → http → cli", "", false},
+			{500 * time.Millisecond, "copilot", "Proposing Postgres + golang-migrate + JWT auth scaffold", "", false},
+			{400 * time.Millisecond, "opencode", "Lean approach: single-binary, BoltDB, stdlib net/http", "", false},
+			{600 * time.Millisecond, "claude", "◆ Judge synthesis: SQLite + chi router, JWT deferred to v2", "", false},
+			{300 * time.Millisecond, "", "Plan synthesized. Type "+sPrimary.Render("y")+" to approve or "+sPrimary.Render("n")+" to revise.", "plan_done", false},
+		}
+
+	case cmd == "y" || cmd == "yes":
+		if m.phase == "plan" {
+			m.pushLog(logOk, "", "Plan approved ✓")
+			m.phase = "divide"
+			m.busy = true
+			m.setAgents("ready")
+			m.setAgent("claude", "running")
+			m.pushLog(logSys, "", "")
+			m.pushLog(logSys, "", sPrimary.Render("── Divide Phase ──"))
+			m.queue = []flowStep{
+				{500 * time.Millisecond, "claude", "Generating dependency-safe task manifest…", "mkTasks", false},
+				{300 * time.Millisecond, "", "3 tasks created. Type "+sPrimary.Render("work")+" to start execution.", "divide_done", false},
+			}
+		} else {
+			m.pushLog(logSys, "", "Nothing to approve.")
+		}
+
+	case cmd == "n" || cmd == "no":
+		if m.phase == "plan" {
+			m.pushLog(logSys, "", "Plan rejected. Type "+sPrimary.Render("plan <desc>")+" to re-plan.")
+			m.phase = "idle"
+			m.busy = false
+			m.setAgents("ready")
+		}
+
+	case cmd == "divide" || cmd == "/divide":
+		if m.busy {
+			m.pushLog(logErr, "", "Workflow already running.")
+			return
+		}
+		m.phase = "divide"
+		m.busy = true
+		m.setAgent("claude", "running")
+		m.pushLog(logSys, "", "")
+		m.pushLog(logSys, "", sPrimary.Render("── Divide Phase ──"))
+		m.queue = []flowStep{
+			{500 * time.Millisecond, "claude", "Generating dependency-safe task manifest…", "mkTasks", false},
+			{300 * time.Millisecond, "", "3 tasks created. Type "+sPrimary.Render("work")+" to start.", "divide_done", false},
+		}
+
+	case cmd == "work" || cmd == "/work":
+		if m.busy {
+			m.pushLog(logErr, "", "Workflow already running.")
+			return
+		}
+		if len(m.tasks) == 0 {
+			m.pushLog(logErr, "", "No tasks. Run "+sPrimary.Render("divide")+" first.")
+			return
+		}
+		m.phase = "work"
+		m.busy = true
+		m.screen = scrWork
 		m.setAgent("claude", "running")
 		m.setAgent("opencode", "running")
+		m.pushLog(logSys, "", "")
+		m.pushLog(logSys, "", sPrimary.Render("── Work Phase ──"))
 		m.queue = []flowStep{
-			{260 * time.Millisecond, "claude", "Plan: architecture + state transitions.", "", false},
-			{300 * time.Millisecond, "opencode", "Plan: implementation + testing strategy.", "", false},
-			{300 * time.Millisecond, "judge", "Judge merged the best parts into one plan.", "", false},
-			{220 * time.Millisecond, "", "Plan approved in prototype flow.", "approve", false},
+			{600 * time.Millisecond, "claude", "[task-001] Defining data models… store.go + types", "t1_prog", false},
+			{800 * time.Millisecond, "claude", "[task-001] ✓ Complete — 124 lines, 3 types", "t1_done", false},
+			{500 * time.Millisecond, "opencode", "[task-002] Building storage layer… sqlite.go", "t2_prog", false},
+			{700 * time.Millisecond, "opencode", "[task-002] Running tests… 4/4 pass", "t2_prog2", false},
+			{500 * time.Millisecond, "opencode", "[task-002] ✓ Complete — 287 lines", "t2_done", false},
+			{400 * time.Millisecond, "copilot", "[task-003] Writing docs + smoke tests…", "t3_prog", false},
+			{600 * time.Millisecond, "copilot", "[task-003] ✓ Complete — README + test client", "t3_done", false},
+			{300 * time.Millisecond, "", "All tasks complete ✓", "all_done", true},
 		}
-	case "/divide":
-		if m.busy {
-			m.push(kErr, "", "Workflow already running")
-			return
+
+	case strings.HasPrefix(cmd, "chat") || strings.HasPrefix(cmd, "/chat"):
+		msg := strings.TrimPrefix(strings.TrimPrefix(cmd, "/chat"), "chat")
+		msg = strings.TrimSpace(msg)
+		if msg == "" {
+			msg = "Hello, what can you help me with?"
 		}
-		m.phase, m.busy = "divide", true
-		m.setAgent("judge", "running")
-		m.queue = []flowStep{
-			{250 * time.Millisecond, "judge", "Generated dependency-safe manifest.", "mkTasks", false},
-			{180 * time.Millisecond, "", "Assignments approved.", "approve", false},
-		}
-	case "/work":
-		if m.busy {
-			m.push(kErr, "", "Workflow already running")
-			return
-		}
-		if len(m.tasks) == 0 {
-			m.push(kErr, "", "No tasks found. Run /divide first.")
-			return
-		}
-		m.phase, m.busy = "work", true
-		m.setAgent("claude", "running")
-		m.setAgent("opencode", "running")
-		m.queue = []flowStep{
-			{260 * time.Millisecond, "claude", "[task-001] board engine complete", "t1", false},
-			{260 * time.Millisecond, "opencode", "[task-002] input parser complete", "t2", false},
-			{260 * time.Millisecond, "judge", "[task-003] final polish complete", "t3", false},
-			{160 * time.Millisecond, "", "Workflow complete.", "", true},
-		}
-	case "/quit":
-		m.push(kSystem, "", "Press Esc or Ctrl+C to quit.")
+		m.pushLog(logSys, "", "")
+		m.pushLog(logAgent, "claude", "I can help you with planning, coding, and debugging. What would you like to work on?")
+
 	default:
-		m.push(kSystem, "", "Unknown command. Try /help")
+		// If no project, treat as project name
+		if m.project == "" {
+			m.project = raw
+			m.pushLog(logSys, "", "")
+			m.pushLog(logOk, "", "Project "+sPrimary.Render(m.project)+" initialized ✓")
+			m.pushLog(logSys, "", sMute.Render("Config: ")+"~/.aros/config.toml")
+			m.pushLog(logSys, "", sMute.Render("Judge:  ")+sClaude.Render("claude")+" · "+sMute.Render("Memory: ")+sOk.Render("connected"))
+			m.pushLog(logSys, "", "")
+			m.pushLog(logSys, "", sMute.Render("Ready. Try ")+sPrimary.Render(`plan "build a REST API"`))
+			m.in.Placeholder = `type command (try: plan "build a REST API")`
+		} else {
+			m.pushLog(logErr, "", "Unknown command. Type "+sPrimary.Render("help")+" for available commands.")
+		}
 	}
 }
 
-func (m *model) applyStep(s flowStep) {
+// ── Flow step handler ──────────────────────────────────────────────────────────
+
+func (m *model) applyFlow(s flowStep) {
 	if s.agent != "" {
-		m.push(kAgent, s.agent, s.text)
-		m.setAgent(s.agent, "active")
+		m.pushLog(logAgent, s.agent, s.text)
 	} else {
-		m.push(kOK, "", s.text)
+		m.pushLog(logOk, "", s.text)
 	}
 
 	switch s.action {
-	case "approve":
-		m.setAgent("judge", "ready")
-		m.setAgent("claude", "ready")
-		m.setAgent("opencode", "ready")
+	case "plan_done":
+		m.setAgents("ready")
+		m.busy = false
+	case "divide_done":
+		m.setAgents("ready")
+		m.busy = false
 	case "mkTasks":
-		m.tasks = []task{
-			{"task-001", "Build board engine", "claude", nil, tsPending},
-			{"task-002", "Build input parser", "opencode", []string{"task-001"}, tsPending},
-			{"task-003", "Finalize and docs", "judge", []string{"task-002"}, tsPending},
+		m.tasks = []taskState{
+			{"task-001", "Define data models", "claude", nil, "pending", 0},
+			{"task-002", "Build storage layer", "opencode", []string{"task-001"}, "pending", 0},
+			{"task-003", "Finalize + docs", "copilot", []string{"task-002"}, "pending", 0},
 		}
-	case "t1":
-		m.setTask("task-001", tsDone)
-		m.setTask("task-002", tsRun)
-	case "t2":
-		m.setTask("task-002", tsDone)
-		m.setTask("task-003", tsRun)
-	case "t3":
-		m.setTask("task-003", tsDone)
+	case "t1_prog":
+		m.setTask("task-001", "running", 0.5)
+	case "t1_done":
+		m.setTask("task-001", "done", 1.0)
+		m.setTask("task-002", "running", 0.0)
+	case "t2_prog":
+		m.setTask("task-002", "running", 0.3)
+	case "t2_prog2":
+		m.setTask("task-002", "running", 0.7)
+	case "t2_done":
+		m.setTask("task-002", "done", 1.0)
+		m.setTask("task-003", "running", 0.0)
+		m.setAgent("opencode", "ready")
+		m.setAgent("copilot", "running")
+	case "t3_prog":
+		m.setTask("task-003", "running", 0.5)
+	case "t3_done":
+		m.setTask("task-003", "done", 1.0)
+	case "all_done":
+		// done flag on flowStep handles reset
 	}
 
 	if s.done {
 		m.phase = "idle"
 		m.busy = false
-		m.setAgent("judge", "ready")
-		m.setAgent("claude", "ready")
-		m.setAgent("opencode", "ready")
+		m.setAgents("ready")
 	}
-
-	m.refresh()
 }
 
-func (m *model) setTask(id string, st taskStatus) {
-	for i := range m.tasks {
-		if m.tasks[i].id == id {
-			m.tasks[i].status = st
-			return
-		}
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+func (m *model) pushLog(k logKind, agent, text string) {
+	m.log = append(m.log, logLine{k, agent, text})
+}
+
+func (m *model) syncViewport() {
+	var lines []string
+	for _, l := range m.log {
+		lines = append(lines, renderLogLine(l))
+	}
+	m.vp.SetContent(strings.Join(lines, "\n"))
+	m.vp.GotoBottom()
+}
+
+func (m *model) relayout() {
+	_, _, mainH := layout(m.w, m.h)
+	leftW, _, _ := layout(m.w, m.h)
+	m.vp.Width = max(20, leftW-4)
+	m.vp.Height = max(4, mainH-2)
+	m.in.Width = max(20, m.w-8)
+}
+
+func (m *model) setAgents(status string) {
+	for i := range m.agents {
+		m.agents[i].status = status
 	}
 }
 
 func (m *model) setAgent(name, status string) {
-	if _, ok := m.agents[name]; ok {
-		m.agents[name] = status
-	}
-}
-
-func (m *model) push(k lineKind, agentName, text string) {
-	m.chat = append(m.chat, chatLine{kind: k, agent: agentName, text: text})
-}
-
-func (m *model) refresh() {
-	var rows []string
-	for _, c := range m.chat {
-		switch c.kind {
-		case kSystem:
-			rows = append(rows, styleSubtle.Render(c.text))
-		case kUser:
-			rows = append(rows, styleUser.Render("[you] "+c.text))
-		case kAgent:
-			rows = append(rows, agentLabel(c.agent)+" "+c.text)
-		case kOK:
-			rows = append(rows, styleOK.Render("[ok] "+c.text))
-		case kErr:
-			rows = append(rows, styleErr.Render("[error] "+c.text))
+	for i := range m.agents {
+		if m.agents[i].name == name {
+			m.agents[i].status = status
 		}
 	}
-	m.vp.SetContent(strings.Join(rows, "\n"))
-	m.vp.GotoBottom()
 }
 
-func (m model) View() string {
-	w := m.w
-	if w == 0 {
-		w = 124
-	}
-	h := m.h
-	if h == 0 {
-		h = 36
-	}
-
-	head := styleTop.Width(w).Render(styleAccent.Render(" ◆ AROS CLI TUI Prototype ") + "   phase: " + strings.ToUpper(m.phase))
-
-	leftW, rightW, mainH := panelLayout(w, h)
-
-	left := styleBox.Width(leftW).Height(mainH).Render("Stream\n" + strings.Repeat("-", max(8, leftW-2)) + "\n" + m.vp.View())
-	body := left
-	if rightW > 0 {
-		right := styleBox.Width(rightW).Height(mainH).Render(m.rightPane(rightW))
-		sep := styleSep.Render(verticalSep(mainH + 2))
-		body = lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right)
-	}
-
-	inputStyle := styleIn
-	prefix := styleAccent.Render("❯") + " "
-	if m.busy {
-		inputStyle = inputStyle.BorderForeground(colorBorder)
-		prefix = m.spin.View() + " "
-	}
-	in := inputStyle.Width(w).Render(prefix + m.in.View())
-	foot := styleFoot.Width(w).Render("Two split layout • Dark purple theme • /plan /divide /work • Esc quit")
-
-	return styleRoot.Render(head + "\n" + body + "\n" + in + "\n" + foot)
-}
-
-func panelLayout(w, h int) (leftW, rightW, mainH int) {
-	mainH = max(8, h-7)
-
-	// Avoid broken wrapping on narrow terminals: collapse to one column.
-	if w < 90 {
-		leftW = max(28, w)
-		rightW = 0
-		return leftW, rightW, mainH
-	}
-
-	leftW = (w * 68) / 100
-	if leftW < 50 {
-		leftW = 50
-	}
-	rightW = w - leftW - 1
-	if rightW < 30 {
-		rightW = 30
-		leftW = w - rightW - 1
-	}
-	return leftW, rightW, mainH
-}
-
-func verticalSep(lines int) string {
-	if lines <= 0 {
-		return ""
-	}
-	var b strings.Builder
-	for i := 0; i < lines; i++ {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString("│")
-	}
-	return b.String()
-}
-
-func (m model) rightPane(width int) string {
-	var b strings.Builder
-	b.WriteString("Agents\n")
-	b.WriteString(strings.Repeat("-", max(8, width-2)) + "\n")
-	names := make([]string, 0, len(m.agents))
-	for n := range m.agents {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		b.WriteString(agentLabel(n) + " " + statusLabel(m.agents[n]) + "\n")
-	}
-	b.WriteString("\nTask Board\n")
-	b.WriteString(strings.Repeat("-", max(8, width-2)) + "\n")
-	if len(m.tasks) == 0 {
-		b.WriteString(styleSubtle.Render("No tasks yet. Run /divide first."))
-		return b.String()
-	}
-	for _, t := range m.tasks {
-		b.WriteString(styleAccent.Render(t.id) + " " + taskBadge(t.status) + "\n")
-		b.WriteString(t.title + "\n")
-		b.WriteString(styleSubtle.Render("owner: "+t.owner) + "\n")
-		if len(t.deps) == 0 {
-			b.WriteString(styleSubtle.Render("deps: none") + "\n\n")
-		} else {
-			b.WriteString(styleSubtle.Render("deps: "+strings.Join(t.deps, ", ")) + "\n\n")
+func (m *model) setTask(id, status string, progress float64) {
+	for i := range m.tasks {
+		if m.tasks[i].id == id {
+			m.tasks[i].status = status
+			m.tasks[i].progress = progress
 		}
 	}
-	return b.String()
 }
 
-func taskBadge(st taskStatus) string {
-	switch st {
-	case tsRun:
-		return styleAccent.Render(string(st))
-	case tsDone:
-		return styleOK.Render(string(st))
+func renderLogLine(l logLine) string {
+	switch l.kind {
+	case logUser:
+		return sPrimary.Render("❯ ") + sText.Render(l.text)
+	case logAgent:
+		return agentSty(l.agent).Render("["+l.agent+"]") + " " + l.text
+	case logOk:
+		return sOk.Render("✓ ") + l.text
+	case logErr:
+		return sErr.Render("✗ ") + l.text
 	default:
-		return styleSubtle.Render(string(st))
+		return l.text
 	}
 }
 
-func statusLabel(s string) string {
-	switch s {
-	case "running", "active":
-		return styleAccent.Render(s)
-	case "error":
-		return styleErr.Render(s)
-	default:
-		return styleSubtle.Render(s)
+func layout(w, h int) (leftW, rightW, mainH int) {
+	mainH = max(6, h-5)
+	if w < 80 {
+		return max(20, w-2), 0, mainH
 	}
-}
-
-func agentLabel(name string) string {
-	s := lipgloss.NewStyle().Bold(true)
-	switch name {
-	case "judge":
-		return s.Foreground(colorGreen).Render("[judge]")
-	case "claude":
-		return s.Foreground(colorAmber).Render("[claude]")
-	case "opencode":
-		return s.Foreground(colorBlue).Render("[opencode]")
-	default:
-		return s.Foreground(colorSubtle).Render("[agent]")
+	rightW = 32
+	if w > 140 {
+		rightW = 38
 	}
-}
-
-func tickStep(step flowStep) tea.Cmd {
-	return tea.Tick(step.delay, func(time.Time) tea.Msg { return flowMsg{step: step} })
-}
-
-func banner() string {
-	return styleAccent.Render(`   █████╗ ██████╗  ██████╗ ███████╗
-  ██╔══██╗██╔══██╗██╔═══██╗██╔════╝
-  ███████║██████╔╝██║   ██║███████╗
-  ██╔══██║██╔══██╗██║   ██║╚════██║
-  ██║  ██║██║  ██║╚██████╔╝███████║
-  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝`)
+	leftW = w - rightW - 3
+	return
 }
 
 func max(a, b int) int {
@@ -496,6 +466,15 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func banner() string {
+	return sPrimary.Render(`  █████╗ ██████╗  ██████╗ ███████╗
+ ██╔══██╗██╔══██╗██╔═══██╗██╔════╝
+ ███████║██████╔╝██║   ██║███████╗
+ ██╔══██║██╔══██╗██║   ██║╚════██║
+ ██║  ██║██║  ██║╚██████╔╝███████║
+ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝`)
 }
 
 func main() {
